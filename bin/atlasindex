@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+import sys
+import os
+import argparse
+import requests
+import json
+
+API_URL = "http://127.0.0.1:8000"
+
+def get_current_project_name() -> str:
+    """Infers a project name from the current working directory name."""
+    cwd = os.getcwd()
+    return os.path.basename(cwd) or "default-project"
+
+def handle_scan(args):
+    path = os.path.abspath(args.path)
+    print(f"Triggering background scan of directory: {path}")
+    try:
+        response = requests.post(f"{API_URL}/projects", json={"path": path}, timeout=5)
+        if response.status_code == 200:
+            print("Scan initiated successfully in the background.")
+        else:
+            print(f"Error: Server returned status {response.status_code}: {response.text}")
+    except requests.exceptions.RequestException as e:
+        print(f"Error: Could not connect to AtlasIndex API server at {API_URL}. Is it running?")
+        print(f"Details: {e}")
+        sys.exit(1)
+
+def handle_reserve_port(args):
+    project_name = args.project or get_current_project_name()
+    port = args.port
+
+    payload = {"project_name": project_name}
+    if port is not None:
+        payload["port"] = port
+
+    try:
+        response = requests.post(f"{API_URL}/ports/reserve", json=payload, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("status") == "success":
+                # Single port reserved successfully, output it
+                print(data["port"])
+            elif data.get("status") == "conflict":
+                # Conflicted port, print space-separated alternatives
+                alts = data.get("suggested_alternatives", [])
+                print(" ".join(map(str, alts)))
+        else:
+            print(f"Error reserving port: {response.text}", file=sys.stderr)
+            sys.exit(1)
+    except requests.exceptions.RequestException:
+        # Fallback: if server is offline, we can access the SQLite DB directly if we are in the workspace
+        # Let's do that to make the CLI tool extremely robust!
+        try:
+            from sqlalchemy.orm import sessionmaker
+            from sqlalchemy import create_engine
+            from atlasindex.storage.models import Project, PortReservation
+            from atlasindex.registry.ports import reserve_port as db_reserve_port
+            
+            db_path = "sqlite:///atlasindex.db"
+            # Look for atlasindex.db in parent directories or current directory
+            for parent in [".", "..", "../.."]:
+                test_path = os.path.join(parent, "atlasindex.db")
+                if os.path.exists(test_path):
+                    db_path = f"sqlite:///{os.path.abspath(test_path)}"
+                    break
+            
+            engine = create_engine(db_path)
+            Session = sessionmaker(bind=engine)
+            session = Session()
+            
+            # If project doesn't exist, register it automatically to make DB fallback smooth
+            proj = session.query(Project).filter(Project.name == project_name).first()
+            if not proj:
+                proj = Project(
+                    name=project_name,
+                    path=os.getcwd(),
+                    description="Automatically registered by CLI fallback"
+                )
+                session.add(proj)
+                session.commit()
+                
+            ports = db_reserve_port(session, project_name, port)
+            print(" ".join(map(str, ports)))
+            session.close()
+        except Exception as e:
+            print(f"Error: API server is offline and database fallback failed.", file=sys.stderr)
+            print(f"Details: {e}", file=sys.stderr)
+            sys.exit(1)
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="AtlasIndex command-line interface for project registry and port allocation."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # scan subcommand
+    scan_parser = subparsers.add_parser("scan", help="Scan a directory path to discover and index projects.")
+    scan_parser.add_argument("path", nargs="?", default=".", help="Directory path to scan (defaults to current directory)")
+
+    # reserve-port subcommand
+    reserve_parser = subparsers.add_parser("reserve-port", help="Request a port reservation or get alternatives.")
+    reserve_parser.add_argument("--project", "-p", help="Project name (defaults to current directory folder name)")
+    reserve_parser.add_argument("port", nargs="?", type=int, help="Optional specific port to request")
+
+    args = parser.parse_code = parser.parse_args()
+
+    if args.command == "scan":
+        handle_scan(args)
+    elif args.command == "reserve-port":
+        handle_reserve_port(args)
+
+if __name__ == "__main__":
+    main()
